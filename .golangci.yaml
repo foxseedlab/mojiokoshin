@@ -1,0 +1,12 @@
+version: "2"
+
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+  tests: false
+  allow-parallel-runners: true
+  allow-serial-runners: true
+  concurrency: 4
+
+linters:
+  default: standard

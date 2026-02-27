@@ -1,0 +1,19 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/app
+    environment:
+      ENVIRONMENT: development
+
+  postgres:
+    image: postgres:17.9
+    ports:
+      - 127.0.0.1:5432:5432
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: mojiokoshin
+    user: postgres:postgres
