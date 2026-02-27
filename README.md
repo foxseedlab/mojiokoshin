@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./docs/logos/mojiokoshin-logo-dark.png" height="64">
-    <source media="(prefers-color-scheme: light)" srcset="./docs/logos/mojiokoshin-logo-light.png" height="64">
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/logos/mojiokoshin-logo-dark.svg" height="64">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/logos/mojiokoshin-logo-light.svg" height="64">
     <img src="./docs/logos/mojiokoshin-logo-light.png" height="64" alt="Mojiokoshin" />
   </picture>
 </p>
