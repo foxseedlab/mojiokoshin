@@ -23,6 +23,7 @@ import (
 const (
 	audioMixInterval = 20 * time.Millisecond
 	audioFrameBytes  = 960 * 2 * 2
+	stopAllWaitLimit = 25 * time.Second
 
 	commandMojiokoshi     = "mojiokoshi"
 	commandMojiokoshiStop = "mojiokoshi-stop"
@@ -30,6 +31,19 @@ const (
 	stopReasonParticipantsLeft = "all participants left voice channel"
 	stopReasonManualSlash      = "stopped by slash command"
 	stopReasonMaxDuration      = "maximum transcribe duration exceeded"
+	stopReasonBotRemoved       = "transcription bot was removed from voice channel"
+	stopReasonServerClosed     = "transcription server closed"
+	stopReasonUnknownError     = "unknown error"
+)
+
+const (
+	StopReasonServerClosed = stopReasonServerClosed
+	StopReasonUnknownError = stopReasonUnknownError
+)
+
+var (
+	finalizeSegmentLookupTimeout = 3 * time.Second
+	finalizeMetadataTimeout      = 2 * time.Second
 )
 
 type Manager struct {
@@ -66,11 +80,11 @@ type runningSession struct {
 var slashCommandDefs = []discord.SlashCommandDefinition{
 	{
 		Name:        commandMojiokoshi,
-		Description: "実行したユーザーがいるVCで文字起こしを開始します",
+		Description: slashCommandStartDescription,
 	},
 	{
 		Name:        commandMojiokoshiStop,
-		Description: "実行したユーザーがいるVCの文字起こしを停止します",
+		Description: slashCommandStopDescription,
 	},
 }
 
@@ -112,7 +126,7 @@ func (m *Manager) SetBotUserID(botUserID string) {
 func (m *Manager) HandleSlashCommand(event discord.SlashCommandEvent) {
 	slog.Info("slash command received by manager", "guild_id", event.GuildID, "channel_id", event.ChannelID, "command", event.CommandName, "user_id", event.UserID)
 	if event.GuildID != m.cfg.DiscordGuildID {
-		m.respondEphemeral(event, "このサーバーでは実行できません。")
+		m.respondEphemeral(event, messageEphemeralWrongGuild)
 		return
 	}
 
@@ -123,7 +137,7 @@ func (m *Manager) HandleSlashCommand(event discord.SlashCommandEvent) {
 		m.handleStopCommand(event)
 	default:
 		slog.Warn("unknown slash command received", "command", event.CommandName, "guild_id", event.GuildID, "channel_id", event.ChannelID, "user_id", event.UserID)
-		m.respondEphemeral(event, "不明なコマンドです。")
+		m.respondEphemeral(event, messageEphemeralUnknownCommand)
 	}
 }
 
@@ -131,47 +145,47 @@ func (m *Manager) handleStartCommand(event discord.SlashCommandEvent) {
 	channelID, err := m.discord.GetUserVoiceChannelID(event.GuildID, event.UserID)
 	if err != nil {
 		slog.Error("failed to resolve user voice channel", "error", err, "guild_id", event.GuildID, "user_id", event.UserID, "command", event.CommandName)
-		m.respondEphemeral(event, "VC参加状態の確認に失敗しました。")
+		m.respondEphemeral(event, messageEphemeralVoiceLookupFailed)
 		return
 	}
 	if channelID == "" {
-		m.respondEphemeral(event, "VCに参加してから実行してください。")
+		m.respondEphemeral(event, messageEphemeralJoinVCFirst)
 		return
 	}
 	if m.isSessionRunning(event.GuildID, channelID) {
-		m.respondEphemeral(event, "このVCでは既に文字起こしが実行中です。")
+		m.respondEphemeral(event, messageEphemeralAlreadyRunning)
 		return
 	}
 	if err := m.startSession(event.GuildID, channelID, event.UserID, false); err != nil {
 		slog.Error("failed to start session by slash command", "error", err, "guild_id", event.GuildID, "channel_id", channelID, "user_id", event.UserID)
-		m.respondEphemeral(event, "文字起こしの開始に失敗しました。")
+		m.respondEphemeral(event, messageEphemeralStartFailed)
 		return
 	}
-	m.respondEphemeral(event, "文字起こしを開始しました。")
+	m.respondEphemeral(event, m.startEphemeralMessage(channelID))
 }
 
 func (m *Manager) handleStopCommand(event discord.SlashCommandEvent) {
 	channelID, err := m.discord.GetUserVoiceChannelID(event.GuildID, event.UserID)
 	if err != nil {
 		slog.Error("failed to resolve user voice channel", "error", err, "guild_id", event.GuildID, "user_id", event.UserID, "command", event.CommandName)
-		m.respondEphemeral(event, "VC参加状態の確認に失敗しました。")
+		m.respondEphemeral(event, messageEphemeralVoiceLookupFailed)
 		return
 	}
 	if channelID == "" {
-		m.respondEphemeral(event, "VCに参加してから実行してください。")
+		m.respondEphemeral(event, messageEphemeralJoinVCFirst)
 		return
 	}
 	stopped, err := m.stopSession(event.GuildID, channelID, stopReasonManualSlash)
 	if err != nil {
 		slog.Error("failed to stop session by slash command", "error", err, "guild_id", event.GuildID, "channel_id", channelID, "user_id", event.UserID)
-		m.respondEphemeral(event, "文字起こしの停止に失敗しました。")
+		m.respondEphemeral(event, messageEphemeralStopFailed)
 		return
 	}
 	if !stopped {
-		m.respondEphemeral(event, "現在このVCでは文字起こしは実行されていません。")
+		m.respondEphemeral(event, messageEphemeralNotRunning)
 		return
 	}
-	m.respondEphemeral(event, "文字起こしを停止しました。")
+	m.respondEphemeral(event, m.stopEphemeralMessage(channelID))
 }
 
 func (m *Manager) respondEphemeral(event discord.SlashCommandEvent, content string) {
@@ -204,6 +218,28 @@ func (m *Manager) HandleVoiceStateUpdate(event discord.VoiceStateEvent) {
 		slog.Info("ignoring voice event for different guild", "event_guild_id", event.GuildID, "configured_guild_id", m.cfg.DiscordGuildID)
 		return
 	}
+	if m.handleBotRemovalEvent(event) {
+		return
+	}
+	m.trackVoiceParticipants(event)
+	m.startAutoTranscribeIfConfigured(event)
+}
+
+func (m *Manager) handleBotRemovalEvent(event discord.VoiceStateEvent) bool {
+	if !m.isSelfBotRemovedFromVoiceChannel(event) {
+		return false
+	}
+	if _, err := m.stopSession(event.GuildID, event.BeforeChannelID, stopReasonBotRemoved); err != nil {
+		slog.Error("failed to stop session for bot removal", "error", err, "guild_id", event.GuildID, "channel_id", event.BeforeChannelID)
+	}
+	return true
+}
+
+func (m *Manager) trackVoiceParticipants(event discord.VoiceStateEvent) {
+	if event.BeforeChannelID == "" && event.AfterChannelID == "" {
+		m.removeParticipantFromKnownSessions(event.GuildID, event.UserID, event.UserIsBot)
+		return
+	}
 	if event.BeforeChannelID != "" {
 		if err := m.removeParticipantAndMaybeStop(event.GuildID, event.BeforeChannelID, event.UserID, event.UserIsBot); err != nil {
 			slog.Error("failed to remove participant", "error", err, "guild_id", event.GuildID, "channel_id", event.BeforeChannelID, "user_id", event.UserID)
@@ -212,6 +248,43 @@ func (m *Manager) HandleVoiceStateUpdate(event discord.VoiceStateEvent) {
 	if event.AfterChannelID != "" {
 		m.addParticipantIfSessionRunning(event.GuildID, event.AfterChannelID, event.UserID, event.UserIsBot)
 	}
+}
+
+func (m *Manager) removeParticipantFromKnownSessions(guildID, userID string, userIsBot bool) {
+	if strings.TrimSpace(guildID) == "" || strings.TrimSpace(userID) == "" {
+		return
+	}
+	channelIDs := m.findSessionChannelsByActiveParticipant(guildID, userID)
+	for _, channelID := range channelIDs {
+		if err := m.removeParticipantAndMaybeStop(guildID, channelID, userID, userIsBot); err != nil {
+			slog.Error("failed to remove participant from inferred channel", "error", err, "guild_id", guildID, "channel_id", channelID, "user_id", userID)
+		}
+	}
+}
+
+func (m *Manager) findSessionChannelsByActiveParticipant(guildID, userID string) []string {
+	prefix := guildID + ":"
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]string, 0, 1)
+	for key, rs := range m.sessions {
+		if !strings.HasPrefix(key, prefix) || rs == nil {
+			continue
+		}
+		if _, ok := rs.activeParticipants[userID]; !ok {
+			continue
+		}
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			continue
+		}
+		out = append(out, parts[1])
+	}
+	return out
+}
+
+func (m *Manager) startAutoTranscribeIfConfigured(event discord.VoiceStateEvent) {
 	if !m.cfg.DiscordAutoTranscribe {
 		return
 	}
@@ -288,19 +361,45 @@ func (m *Manager) startSession(guildID, channelID, userID string, userIsBot bool
 	m.mu.Unlock()
 	slog.Info("session activated", "session_key", key, "session_id", created.ID, "active_participants", len(rs.activeParticipants), "all_participants", len(rs.allParticipants))
 
-	_ = m.discord.SendChannelMessage(channelID, "文字起こしを開始しました。")
+	_ = m.discord.SendChannelMessage(channelID, m.startChannelMessage())
 
 	var receivedOpusPackets int64
-	go voice.ReceiveAudio(func(audioUserID string, opusPacket []byte) {
-		n := atomic.AddInt64(&receivedOpusPackets, 1)
-		if n == 1 || n%500 == 0 {
-			slog.Info("received opus packet", "session_id", created.ID, "user_id", audioUserID, "packet_bytes", len(opusPacket), "total_packets", n)
-		}
-		mixer.WriteOpusPacket(audioUserID, opusPacket)
+	m.runSessionWorker(guildID, channelID, created.ID, "voice_receive", func() {
+		voice.ReceiveAudio(func(audioUserID string, opusPacket []byte) {
+			n := atomic.AddInt64(&receivedOpusPackets, 1)
+			if n == 1 || n%500 == 0 {
+				slog.Info("received opus packet", "session_id", created.ID, "user_id", audioUserID, "packet_bytes", len(opusPacket), "total_packets", n)
+			}
+			mixer.WriteOpusPacket(audioUserID, opusPacket)
+		})
 	})
-	go m.streamMixedAudio(streamCtx, created.ID, mixer, writer, &receivedOpusPackets)
-	go m.watchSessionTimeoutForSession(streamCtx, guildID, channelID, created.ID)
+	m.runSessionWorker(guildID, channelID, created.ID, "audio_stream", func() {
+		m.streamMixedAudio(streamCtx, created.ID, mixer, writer, &receivedOpusPackets)
+	})
+	m.runSessionWorker(guildID, channelID, created.ID, "session_timeout_watch", func() {
+		m.watchSessionTimeoutForSession(streamCtx, guildID, channelID, created.ID)
+	})
 	return nil
+}
+
+func (m *Manager) runSessionWorker(guildID, channelID, sessionID, workerName string, fn func()) {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				slog.Error("session worker panicked",
+					"panic", recovered,
+					"worker", workerName,
+					"session_id", sessionID,
+					"guild_id", guildID,
+					"channel_id", channelID,
+				)
+				if _, err := m.stopSession(guildID, channelID, stopReasonUnknownError); err != nil {
+					slog.Error("failed to stop session after worker panic", "error", err, "session_id", sessionID, "worker", workerName)
+				}
+			}
+		}()
+		fn()
+	}()
 }
 
 func (m *Manager) onSessionAlreadyActive(key string, rs *runningSession, userID string, userIsBot, countable bool) {
@@ -417,6 +516,17 @@ func (m *Manager) getBotUserID() string {
 	botUserID = m.botUserID
 	m.mu.Unlock()
 	return botUserID
+}
+
+func (m *Manager) isSelfBotRemovedFromVoiceChannel(event discord.VoiceStateEvent) bool {
+	if event.BeforeChannelID == "" || event.BeforeChannelID == event.AfterChannelID {
+		return false
+	}
+	botUserID := m.getBotUserID()
+	if botUserID == "" {
+		return false
+	}
+	return event.UserID == botUserID
 }
 
 func (m *Manager) addParticipantToSession(rs *runningSession, userID string, isBot bool, seenAt time.Time) {
@@ -541,25 +651,106 @@ func (m *Manager) streamMixedAudio(ctx context.Context, sessionID string, mixer 
 }
 
 func (m *Manager) stopSession(guildID, channelID, reason string) (bool, error) {
-	key := m.sessionKey(guildID, channelID)
-	m.mu.Lock()
-	rs, ok := m.sessions[key]
-	if ok {
-		delete(m.sessions, key)
-		if rs.repoSession != nil {
-			m.stopReasons[rs.repoSession.ID] = reason
-		}
+	if strings.TrimSpace(reason) == "" {
+		reason = stopReasonUnknownError
 	}
-	m.mu.Unlock()
-	if !ok {
+	rs, ok := m.extractSingleSessionForStop(guildID, channelID, reason)
+	if !ok || rs == nil {
 		return false, nil
 	}
-	if rs.repoSession == nil {
+	if rs.repoSession == nil || strings.TrimSpace(rs.repoSession.ID) == "" {
 		return false, nil
 	}
 
 	endedAt := time.Now()
 	slog.Info("stopping session", "session_id", rs.repoSession.ID, "channel_id", channelID, "reason", reason)
+	m.terminateSessionRuntime(rs)
+	go m.runFinalizeSession(rs, channelID, reason, endedAt)
+	return true, nil
+}
+
+func (m *Manager) StopAllSessions(reason string) int {
+	if strings.TrimSpace(reason) == "" {
+		reason = stopReasonUnknownError
+	}
+	sessions := m.extractAllSessionsForStop(reason)
+	if len(sessions) == 0 {
+		return 0
+	}
+
+	var wg sync.WaitGroup
+	for _, stopped := range sessions {
+		if stopped.rs == nil || stopped.rs.repoSession == nil || strings.TrimSpace(stopped.rs.repoSession.ID) == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(stopped stoppedSession) {
+			defer wg.Done()
+			m.terminateSessionRuntime(stopped.rs)
+			m.runFinalizeSession(stopped.rs, stopped.channelID, reason, time.Now())
+		}(stopped)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(stopAllWaitLimit):
+		slog.Warn("timed out waiting for session finalization on shutdown", "reason", reason, "session_count", len(sessions), "timeout", stopAllWaitLimit.String())
+	}
+	return len(sessions)
+}
+
+type stoppedSession struct {
+	channelID string
+	rs        *runningSession
+}
+
+func (m *Manager) extractSingleSessionForStop(guildID, channelID, reason string) (*runningSession, bool) {
+	key := m.sessionKey(guildID, channelID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs, ok := m.sessions[key]
+	if !ok {
+		return nil, false
+	}
+	delete(m.sessions, key)
+	if rs != nil && rs.repoSession != nil {
+		m.stopReasons[rs.repoSession.ID] = reason
+	}
+	return rs, true
+}
+
+func (m *Manager) extractAllSessionsForStop(reason string) []stoppedSession {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]stoppedSession, 0, len(m.sessions))
+	for key, rs := range m.sessions {
+		channelID := ""
+		if rs != nil && rs.repoSession != nil && rs.repoSession.ChannelID != "" {
+			channelID = rs.repoSession.ChannelID
+		} else {
+			parts := strings.SplitN(key, ":", 2)
+			if len(parts) == 2 {
+				channelID = parts[1]
+			}
+		}
+		out = append(out, stoppedSession{channelID: channelID, rs: rs})
+		if rs != nil && rs.repoSession != nil {
+			m.stopReasons[rs.repoSession.ID] = reason
+		}
+		delete(m.sessions, key)
+	}
+	return out
+}
+
+func (m *Manager) terminateSessionRuntime(rs *runningSession) {
+	if rs == nil {
+		return
+	}
 	if rs.cancel != nil {
 		rs.cancel()
 	}
@@ -572,57 +763,112 @@ func (m *Manager) stopSession(guildID, channelID, reason string) (bool, error) {
 	if rs.voice != nil {
 		_ = rs.voice.Disconnect()
 	}
+}
 
-	go m.finalizeSession(rs, channelID, reason, endedAt)
-	return true, nil
+func (m *Manager) runFinalizeSession(rs *runningSession, channelID, reason string, endedAt time.Time) {
+	started := time.Now()
+	sessionID := ""
+	if rs != nil && rs.repoSession != nil {
+		sessionID = rs.repoSession.ID
+	}
+	slog.Info("session finalization started", "session_id", sessionID, "channel_id", channelID, "reason", reason)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("panic while finalizing session", "panic", recovered, "session_id", sessionID, "channel_id", channelID, "reason", reason)
+			return
+		}
+		slog.Info("session finalization completed", "session_id", sessionID, "channel_id", channelID, "reason", reason, "elapsed_ms", time.Since(started).Milliseconds())
+	}()
+	m.finalizeSession(rs, channelID, reason, endedAt)
 }
 
 func (m *Manager) finalizeSession(rs *runningSession, channelID, reason string, endedAt time.Time) {
 	ctx := context.Background()
-	s := rs.repoSession
-	segments, err := m.repo.ListSegmentsBySessionID(ctx, s.ID)
-	if err != nil {
-		slog.Error("failed to list transcript segments", "error", err, "session_id", s.ID)
+	if rs == nil || rs.repoSession == nil {
+		slog.Warn("skipping finalize for empty session state", "channel_id", channelID, "reason", reason)
 		return
 	}
+	s := rs.repoSession
+	m.sendDiscordStopMessage(s.ID, channelID, reason)
 
-	participantUserIDs := make([]string, 0, len(rs.allParticipants))
-	for userID := range rs.allParticipants {
+	segmentsCtx, cancelSegments := context.WithTimeout(ctx, finalizeSegmentLookupTimeout)
+	segments, segmentsAvailable := m.listSegmentsBestEffort(segmentsCtx, s.ID)
+	cancelSegments()
+
+	participantUserIDs := participantUserIDsFromStates(rs.allParticipants)
+	metadataCtx, cancelMetadata := context.WithTimeout(ctx, finalizeMetadataTimeout)
+	meta := m.resolveTranscriptMetadataBestEffort(metadataCtx, s, participantUserIDs, rs.allParticipants)
+	cancelMetadata()
+
+	filename := fmt.Sprintf("transcript-%s.txt", s.ID)
+	body := buildTranscriptText(meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
+	if !segmentsAvailable {
+		body = append(body, []byte("\n\n(文字起こし本文の取得に失敗したため、取得できた範囲のみを添付しています)\n")...)
+	}
+	m.sendDiscordTranscriptAttachment(s.ID, channelID, filename, body)
+	m.completeSessionBestEffort(ctx, s.ID, endedAt)
+
+	payload := buildTranscriptWebhookPayload(s.ID, meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
+	slog.Info("sending transcript webhook payload", "session_id", s.ID, "discord_server_id", payload.DiscordServerID, "discord_server_name", payload.DiscordServerName, "discord_voice_channel_id", payload.DiscordVoiceChannelID, "discord_voice_channel_name", payload.DiscordVoiceChannelName, "segment_count", payload.SegmentCount)
+	m.saveSessionOutputBestEffort(ctx, s, reason, endedAt, meta, filename, body, payload, rs.allParticipants)
+	m.sendWebhookBestEffort(ctx, s.ID, payload)
+}
+
+func (m *Manager) listSegmentsBestEffort(ctx context.Context, sessionID string) ([]repository.TranscriptSegment, bool) {
+	segments, err := m.repo.ListSegmentsBySessionID(ctx, sessionID)
+	if err != nil {
+		slog.Error("failed to list transcript segments", "error", err, "session_id", sessionID)
+		return []repository.TranscriptSegment{}, false
+	}
+	return segments, true
+}
+
+func participantUserIDsFromStates(states map[string]participantState) []string {
+	participantUserIDs := make([]string, 0, len(states))
+	for userID := range states {
 		participantUserIDs = append(participantUserIDs, userID)
 	}
 	sort.Strings(participantUserIDs)
+	return participantUserIDs
+}
 
+func (m *Manager) resolveTranscriptMetadataBestEffort(ctx context.Context, s *repository.Session, participantUserIDs []string, allParticipants map[string]participantState) discord.TranscriptMetadata {
 	meta, err := m.discord.ResolveTranscriptMetadata(ctx, s.GuildID, s.ChannelID, participantUserIDs)
 	if err != nil {
 		slog.Warn("failed to resolve transcript metadata; using fallback values", "error", err, "session_id", s.ID)
 		meta = transcriptMetadataFallbackFromSession(s)
 	}
-	meta = fillTranscriptMetadataFallbacks(meta, s, participantUserIDs, rs.allParticipants)
+	meta = fillTranscriptMetadataFallbacks(meta, s, participantUserIDs, allParticipants)
 	slog.Info("resolved transcript metadata", "session_id", s.ID, "discord_server_id", meta.DiscordServerID, "discord_server_name", meta.DiscordServerName, "discord_voice_channel_id", meta.DiscordVoiceChannelID, "discord_voice_channel_name", meta.DiscordVoiceChannelName, "participants", len(meta.Participants))
+	return meta
+}
 
-	filename := fmt.Sprintf("transcript-%s.txt", s.ID)
-	body := buildTranscriptText(meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
-	content := stopReasonMessage(reason)
-	_ = m.discord.SendChannelMessageWithFile(discord.FileMessage{
+func (m *Manager) sendDiscordStopMessage(sessionID, channelID, reason string) {
+	if err := m.discord.SendChannelMessage(channelID, m.stopChannelMessage(reason)); err != nil {
+		slog.Error("failed to send stop message", "error", err, "session_id", sessionID, "channel_id", channelID, "reason", reason)
+	}
+}
+
+func (m *Manager) sendDiscordTranscriptAttachment(sessionID, channelID, filename string, body []byte) {
+	if err := m.discord.SendChannelMessageWithFile(discord.FileMessage{
 		ChannelID: channelID,
-		Content:   content,
+		Content:   m.transcriptAttachmentMessage(),
 		Filename:  filename,
 		FileBody:  body,
-	})
-
-	if err := m.repo.UpdateSessionCompleted(ctx, repository.CompleteSessionInput{SessionID: s.ID, EndedAt: endedAt}); err != nil {
-		slog.Error("failed to complete session", "error", err, "session_id", s.ID)
+	}); err != nil {
+		slog.Error("failed to send transcript attachment", "error", err, "session_id", sessionID, "channel_id", channelID)
 	}
+}
 
-	payload := buildTranscriptWebhookPayload(s.ID, meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
-	slog.Info("sending transcript webhook payload", "session_id", s.ID, "discord_server_id", payload.DiscordServerID, "discord_server_name", payload.DiscordServerName, "discord_voice_channel_id", payload.DiscordVoiceChannelID, "discord_voice_channel_name", payload.DiscordVoiceChannelName, "segment_count", payload.SegmentCount)
-
-	participantSnapshots := m.buildParticipantSnapshots(meta, rs.allParticipants, s.StartedAt, endedAt)
-	payloadJSON, marshalErr := json.Marshal(payload)
-	if marshalErr != nil {
-		slog.Error("failed to marshal webhook payload for database persistence", "error", marshalErr, "session_id", s.ID)
-		payloadJSON = nil
+func (m *Manager) completeSessionBestEffort(ctx context.Context, sessionID string, endedAt time.Time) {
+	if err := m.repo.UpdateSessionCompleted(ctx, repository.CompleteSessionInput{SessionID: sessionID, EndedAt: endedAt}); err != nil {
+		slog.Error("failed to complete session", "error", err, "session_id", sessionID)
 	}
+}
+
+func (m *Manager) saveSessionOutputBestEffort(ctx context.Context, s *repository.Session, reason string, endedAt time.Time, meta discord.TranscriptMetadata, filename string, body []byte, payload webhook.TranscriptWebhookPayload, allParticipants map[string]participantState) {
+	participantSnapshots := m.buildParticipantSnapshots(meta, allParticipants, s.StartedAt, endedAt)
+	payloadJSON := marshalPayloadBestEffort(payload, s.ID)
 	saveInput := repository.SaveSessionOutputInput{
 		SessionID:          s.ID,
 		EndedAt:            endedAt,
@@ -640,9 +886,20 @@ func (m *Manager) finalizeSession(rs *runningSession, channelID, reason string, 
 	if err := m.repo.SaveSessionOutput(ctx, saveInput); err != nil {
 		slog.Error("failed to save session output", "error", err, "session_id", s.ID)
 	}
+}
 
+func marshalPayloadBestEffort(payload webhook.TranscriptWebhookPayload, sessionID string) []byte {
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("failed to marshal webhook payload for database persistence", "error", err, "session_id", sessionID)
+		return nil
+	}
+	return payloadJSON
+}
+
+func (m *Manager) sendWebhookBestEffort(ctx context.Context, sessionID string, payload webhook.TranscriptWebhookPayload) {
 	if err := m.webhook.SendTranscript(ctx, payload); err != nil {
-		slog.Error("failed to send webhook transcript", "error", err, "session_id", s.ID)
+		slog.Error("failed to send webhook transcript", "error", err, "session_id", sessionID)
 	}
 }
 
@@ -716,17 +973,56 @@ func fallbackParticipants(participantUserIDs []string, allParticipants map[strin
 	return participants
 }
 
-func stopReasonMessage(reason string) string {
-	switch reason {
-	case stopReasonMaxDuration:
-		return "文字起こしを終了しました（最大文字起こし時間を超過したため）。結果を添付します。"
-	case stopReasonManualSlash:
-		return "文字起こしを終了しました（手動停止）。結果を添付します。"
-	case stopReasonParticipantsLeft:
-		return "文字起こしを終了しました（VCの参加者がいなくなったため）。結果を添付します。"
-	default:
-		return "文字起こしを終了しました。結果を添付します。"
+func (m *Manager) startChannelMessage() string {
+	lines := []string{
+		messageStartChannelTitle,
+		messageStartChannelHint,
 	}
+	return strings.Join(m.withPoweredByForBrand(lines), "\n")
+}
+
+func (m *Manager) stopChannelMessage(reason string) string {
+	restart := messageStopRestart
+	if stopReasonNeedsRestartAgain(reason) {
+		restart = messageStopRestartAgain
+	}
+	lines := []string{
+		messageStopChannelTitle,
+		"-# " + stopReasonDetail(reason),
+		"-# " + restart,
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Manager) transcriptAttachmentMessage() string {
+	lines := []string{
+		messageAttachmentTitle,
+	}
+	return strings.Join(m.withPoweredByForBrand(lines), "\n")
+}
+
+func (m *Manager) startEphemeralMessage(channelID string) string {
+	lines := []string{
+		startEphemeralTitle(channelID),
+		messageStartEphemeralSecondLine,
+		messageStartEphemeralHint,
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Manager) stopEphemeralMessage(channelID string) string {
+	lines := []string{
+		stopEphemeralTitle(channelID),
+		messageStopEphemeralHint,
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Manager) withPoweredByForBrand(lines []string) []string {
+	if m.cfg.DiscordShowPoweredBy {
+		lines = append(lines, messagePoweredByLine)
+	}
+	return lines
 }
 
 func normalizeParticipantBounds(state participantState, startedAt, endedAt time.Time) (time.Time, time.Time) {

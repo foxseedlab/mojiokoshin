@@ -67,6 +67,19 @@ func setupDI(cfg *config.Config) do.Injector {
 }
 
 func runBot(cfg *config.Config, injector do.Injector) {
+	dc, manager := resolveRuntime(injector)
+	defer recoverBotPanic(dc, manager)
+
+	connectDiscordOrExit(dc)
+	configureSlashAndHandlersOrExit(cfg, dc, manager)
+
+	done := startDiscordRunLoop(dc)
+	waitForShutdown(done)
+	shutdownAllSessions(manager, session.StopReasonServerClosed)
+	closeDiscord(dc)
+}
+
+func resolveRuntime(injector do.Injector) (discordpkg.Client, *session.Manager) {
 	dc, err := do.Invoke[discordpkg.Client](injector)
 	if err != nil {
 		slog.Error("failed to resolve discord client", "error", err)
@@ -77,7 +90,21 @@ func runBot(cfg *config.Config, injector do.Injector) {
 		slog.Error("failed to resolve session manager", "error", err)
 		os.Exit(1)
 	}
+	return dc, manager
+}
 
+func recoverBotPanic(dc discordpkg.Client, manager *session.Manager) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	slog.Error("panic recovered in bot runtime", "panic", recovered)
+	shutdownAllSessions(manager, session.StopReasonUnknownError)
+	closeDiscord(dc)
+	os.Exit(1)
+}
+
+func connectDiscordOrExit(dc discordpkg.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), discordConnectTimeout)
 	defer cancel()
 
@@ -87,7 +114,9 @@ func runBot(cfg *config.Config, injector do.Injector) {
 		os.Exit(1)
 	}
 	slog.Info("startup: discord connected")
+}
 
+func configureSlashAndHandlersOrExit(cfg *config.Config, dc discordpkg.Client, manager *session.Manager) {
 	botUserID, err := dc.GetBotUserID()
 	if err != nil {
 		slog.Error("failed to resolve bot user id", "error", err)
@@ -103,12 +132,9 @@ func runBot(cfg *config.Config, injector do.Injector) {
 	dc.RegisterVoiceStateUpdateHandler(manager.HandleVoiceStateUpdate)
 	dc.RegisterSlashCommandHandler(manager.HandleSlashCommand)
 	slog.Info("discord handlers registered", "guild_id", cfg.DiscordGuildID, "commands", []string{"mojiokoshi", "mojiokoshi-stop"})
-	defer func() {
-		if err := dc.Close(); err != nil {
-			slog.Error("discord close failed", "error", err)
-		}
-	}()
+}
 
+func startDiscordRunLoop(dc discordpkg.Client) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		slog.Info("startup: entering discord run loop")
@@ -117,12 +143,35 @@ func runBot(cfg *config.Config, injector do.Injector) {
 		}
 		close(done)
 	}()
+	return done
+}
 
+func waitForShutdown(done <-chan struct{}) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
 	select {
 	case <-sigCh:
-		slog.Info("shutting down")
+		slog.Info("shutdown signal received")
 	case <-done:
+		slog.Info("discord run loop ended")
+	}
+}
+
+func shutdownAllSessions(manager *session.Manager, reason string) {
+	if manager == nil {
+		return
+	}
+	stopped := manager.StopAllSessions(reason)
+	slog.Info("sessions stopped", "count", stopped, "reason", reason)
+}
+
+func closeDiscord(dc discordpkg.Client) {
+	if dc == nil {
+		return
+	}
+	if err := dc.Close(); err != nil {
+		slog.Error("discord close failed", "error", err)
 	}
 }

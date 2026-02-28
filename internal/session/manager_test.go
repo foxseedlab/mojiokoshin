@@ -2,7 +2,9 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,9 +17,11 @@ import (
 )
 
 type mockRepository struct {
-	insertCalls      []repository.InsertSegmentInput
-	savedOutputCalls []repository.SaveSessionOutputInput
-	createCount      int
+	insertCalls       []repository.InsertSegmentInput
+	savedOutputCalls  []repository.SaveSessionOutputInput
+	createCount       int
+	listSegmentsErr   error
+	listSegmentsDelay time.Duration
 }
 
 func (m *mockRepository) CreateSession(_ context.Context, input repository.CreateSessionInput) (*repository.Session, error) {
@@ -49,14 +53,29 @@ func (m *mockRepository) InsertSegment(_ context.Context, input repository.Inser
 	return nil
 }
 
-func (m *mockRepository) ListSegmentsBySessionID(_ context.Context, _ string) ([]repository.TranscriptSegment, error) {
+func (m *mockRepository) ListSegmentsBySessionID(ctx context.Context, _ string) ([]repository.TranscriptSegment, error) {
+	if m.listSegmentsDelay > 0 {
+		timer := time.NewTimer(m.listSegmentsDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if m.listSegmentsErr != nil {
+		return nil, m.listSegmentsErr
+	}
 	return nil, nil
 }
 
 type mockDiscordClient struct {
 	sendCalls            []string
+	fileCalls            []discord.FileMessage
 	userVoiceChannelByID map[string]string
 	botUserID            string
+	resolveMetadataErr   error
+	resolveMetadataDelay time.Duration
 }
 
 func (m *mockDiscordClient) Connect(_ context.Context) error { return nil }
@@ -68,7 +87,10 @@ func (m *mockDiscordClient) SendChannelMessage(_ string, content string) error {
 	m.sendCalls = append(m.sendCalls, content)
 	return nil
 }
-func (m *mockDiscordClient) SendChannelMessageWithFile(_ discord.FileMessage) error { return nil }
+func (m *mockDiscordClient) SendChannelMessageWithFile(msg discord.FileMessage) error {
+	m.fileCalls = append(m.fileCalls, msg)
+	return nil
+}
 func (m *mockDiscordClient) RegisterVoiceStateUpdateHandler(_ func(discord.VoiceStateEvent)) {
 }
 func (m *mockDiscordClient) RegisterSlashCommandHandler(_ func(discord.SlashCommandEvent)) {}
@@ -90,7 +112,19 @@ func (m *mockDiscordClient) GetBotUserID() (string, error) {
 	}
 	return "bot-self", nil
 }
-func (m *mockDiscordClient) ResolveTranscriptMetadata(_ context.Context, guildID, channelID string, participantUserIDs []string) (discord.TranscriptMetadata, error) {
+func (m *mockDiscordClient) ResolveTranscriptMetadata(ctx context.Context, guildID, channelID string, participantUserIDs []string) (discord.TranscriptMetadata, error) {
+	if m.resolveMetadataDelay > 0 {
+		timer := time.NewTimer(m.resolveMetadataDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return discord.TranscriptMetadata{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if m.resolveMetadataErr != nil {
+		return discord.TranscriptMetadata{}, m.resolveMetadataErr
+	}
 	participants := make([]discord.TranscriptParticipant, 0, len(participantUserIDs))
 	for _, userID := range participantUserIDs {
 		participants = append(participants, discord.TranscriptParticipant{UserID: userID, DisplayName: userID})
@@ -143,6 +177,7 @@ func newTestManager(repo repository.Repository, dc discord.Client) *Manager {
 		TranscriptTimezone:         "Asia/Tokyo",
 		DefaultTranscribeLanguage:  "ja-JP",
 		MaxTranscribeDurationMin:   120,
+		DiscordShowPoweredBy:       true,
 		Env:                        "test",
 	}
 	return NewManager(cfg, repo, dc, &mockTranscriber{}, &mockWebhookSender{}, func() audio.Mixer { return &mockMixer{} })
@@ -269,7 +304,7 @@ func TestHandleSlashCommand_StopReturnsNotRunning(t *testing.T) {
 		},
 	})
 
-	if got != "現在このVCでは文字起こしは実行されていません。" {
+	if got != messageEphemeralNotRunning {
 		t.Fatalf("unexpected response: %q", got)
 	}
 }
@@ -292,7 +327,7 @@ func TestHandleSlashCommand_StartAndStopSuccess(t *testing.T) {
 			return nil
 		},
 	})
-	if startResp != "文字起こしを開始しました。" {
+	if startResp != ":microphone2: <#vc-1> **の文字起こしを開始しました。**\n-# ボイスチャンネルのチャットに文字起こしが表示されます。\n-# /mojiokoshi-stop コマンドで中止できます。" {
 		t.Fatalf("unexpected start response: %q", startResp)
 	}
 	if !manager.isSessionRunning("guild-1", "vc-1") {
@@ -309,7 +344,7 @@ func TestHandleSlashCommand_StartAndStopSuccess(t *testing.T) {
 			return nil
 		},
 	})
-	if stopResp != "文字起こしを停止しました。" {
+	if stopResp != ":pause_button:  <#vc-1> **の文字起こしを中止しました。**\n-# /mojiokoshi コマンドで開始できます。" {
 		t.Fatalf("unexpected stop response: %q", stopResp)
 	}
 	if manager.isSessionRunning("guild-1", "vc-1") {
@@ -436,4 +471,316 @@ func TestHandleVoiceStateUpdate_TracksLeaveEvenWhenAutoDisabled(t *testing.T) {
 	if manager.isSessionRunning("guild-1", "vc-1") {
 		t.Fatal("expected session to stop after participant leaves even when auto is disabled")
 	}
+}
+
+func TestHandleVoiceStateUpdate_TracksLeaveWhenBeforeChannelIsUnknown(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{botUserID: "bot-self"}
+	manager := newTestManager(repo, dc)
+	manager.SetBotUserID("bot-self")
+	manager.cfg.DiscordAutoTranscribe = false
+
+	key := manager.sessionKey("guild-1", "vc-1")
+	manager.sessions[key] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-unknown-leave",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{
+			"user-1": {isBot: false},
+		},
+		allParticipants: map[string]participantState{
+			"user-1":   {isBot: false},
+			"bot-self": {isBot: true},
+		},
+	}
+
+	manager.HandleVoiceStateUpdate(discord.VoiceStateEvent{
+		GuildID:         "guild-1",
+		UserID:          "user-1",
+		UserIsBot:       false,
+		BeforeChannelID: "",
+		AfterChannelID:  "",
+	})
+
+	if manager.isSessionRunning("guild-1", "vc-1") {
+		t.Fatal("expected session to stop after unknown-channel leave event")
+	}
+}
+
+func TestPoweredByShownOnlyOnStartAndAttachment(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+
+	if !strings.Contains(manager.startChannelMessage(), messagePoweredByLine) {
+		t.Fatal("expected powered by line on start channel message")
+	}
+	if !strings.Contains(manager.transcriptAttachmentMessage(), messagePoweredByLine) {
+		t.Fatal("expected powered by line on attachment message")
+	}
+	if strings.Contains(manager.stopChannelMessage(stopReasonManualSlash), messagePoweredByLine) {
+		t.Fatal("did not expect powered by line on stop channel message")
+	}
+	if strings.Contains(manager.startEphemeralMessage("vc-1"), messagePoweredByLine) {
+		t.Fatal("did not expect powered by line on start ephemeral message")
+	}
+	if strings.Contains(manager.stopEphemeralMessage("vc-1"), messagePoweredByLine) {
+		t.Fatal("did not expect powered by line on stop ephemeral message")
+	}
+}
+
+func TestHandleVoiceStateUpdate_BotRemovedStopsSession(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{botUserID: "bot-self"}
+	manager := newTestManager(repo, dc)
+	manager.SetBotUserID("bot-self")
+	manager.cfg.DiscordAutoTranscribe = false
+
+	key := manager.sessionKey("guild-1", "vc-1")
+	manager.sessions[key] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-bot-removed",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{
+			"user-1": {isBot: false},
+		},
+		allParticipants: map[string]participantState{
+			"user-1":   {isBot: false},
+			"bot-self": {isBot: true},
+		},
+	}
+
+	manager.HandleVoiceStateUpdate(discord.VoiceStateEvent{
+		GuildID:         "guild-1",
+		UserID:          "bot-self",
+		UserIsBot:       true,
+		BeforeChannelID: "vc-1",
+		AfterChannelID:  "",
+	})
+
+	waitUntil(t, time.Second, func() bool { return !manager.isSessionRunning("guild-1", "vc-1") }, "session should stop when bot is removed")
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "finalize should attach transcript after bot removal")
+	if len(dc.sendCalls) == 0 {
+		t.Fatal("expected stop message to be sent")
+	}
+	if dc.sendCalls[0] != manager.stopChannelMessage(stopReasonBotRemoved) {
+		t.Fatalf("unexpected stop message: %q", dc.sendCalls[0])
+	}
+}
+
+func TestStopAllSessions_StopsRunningSessions(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-stopall-1",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+	manager.sessions[manager.sessionKey("guild-1", "vc-2")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-stopall-2",
+			GuildID:   "guild-1",
+			ChannelID: "vc-2",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-2": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-2": {isBot: false}},
+	}
+
+	count := manager.StopAllSessions(stopReasonServerClosed)
+	if count != 2 {
+		t.Fatalf("expected 2 stopped sessions, got %d", count)
+	}
+	if manager.isSessionRunning("guild-1", "vc-1") || manager.isSessionRunning("guild-1", "vc-2") {
+		t.Fatal("expected all sessions to be stopped")
+	}
+	if len(dc.fileCalls) != 2 {
+		t.Fatalf("expected transcript attachments for all sessions, got %d", len(dc.fileCalls))
+	}
+}
+
+func TestRunSessionWorker_PanicStopsWithUnknownReasonAndSendsAttachment(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-panic-worker",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	manager.runSessionWorker("guild-1", "vc-1", "session-panic-worker", "test_worker", func() {
+		panic("boom")
+	})
+
+	waitUntil(t, time.Second, func() bool { return !manager.isSessionRunning("guild-1", "vc-1") }, "session should stop after worker panic")
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "finalize should attach transcript after worker panic")
+	if len(dc.sendCalls) == 0 {
+		t.Fatal("expected stop message to be sent")
+	}
+	if dc.sendCalls[0] != manager.stopChannelMessage(stopReasonUnknownError) {
+		t.Fatalf("unexpected stop message: %q", dc.sendCalls[0])
+	}
+}
+
+func TestFinalizeSession_ContinuesWhenSegmentLookupFails(t *testing.T) {
+	repo := &mockRepository{listSegmentsErr: errors.New("boom")}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-segment-error",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonUnknownError)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment even when segment lookup fails")
+}
+
+func TestFinalizeSession_SendsStopMessageBeforeSegmentLookup(t *testing.T) {
+	oldTimeout := finalizeSegmentLookupTimeout
+	finalizeSegmentLookupTimeout = 150 * time.Millisecond
+	defer func() { finalizeSegmentLookupTimeout = oldTimeout }()
+
+	repo := &mockRepository{listSegmentsDelay: 3 * time.Second}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-stop-first",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonServerClosed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, 300*time.Millisecond, func() bool { return len(dc.sendCalls) >= 1 }, "expected stop message to be sent immediately")
+	if dc.sendCalls[0] != manager.stopChannelMessage(stopReasonServerClosed) {
+		t.Fatalf("unexpected stop message: %q", dc.sendCalls[0])
+	}
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment after segment lookup timeout")
+}
+
+func TestFinalizeSession_ContinuesWhenMetadataLookupTimesOut(t *testing.T) {
+	oldTimeout := finalizeMetadataTimeout
+	finalizeMetadataTimeout = 100 * time.Millisecond
+	defer func() { finalizeMetadataTimeout = oldTimeout }()
+
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{resolveMetadataDelay: 2 * time.Second}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-meta-timeout",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonUnknownError)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment even when metadata lookup times out")
+	if len(repo.savedOutputCalls) != 1 {
+		t.Fatalf("expected one persisted session output, got %d", len(repo.savedOutputCalls))
+	}
+}
+
+func TestFinalizeSession_AttachmentContainsFallbackNoticeWhenSegmentsUnavailable(t *testing.T) {
+	repo := &mockRepository{listSegmentsErr: errors.New("boom")}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-fallback-attachment",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonUnknownError)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected transcript attachment")
+	if !strings.Contains(string(dc.fileCalls[0].FileBody), "文字起こし本文の取得に失敗") {
+		t.Fatalf("expected fallback notice in attachment body, got: %q", string(dc.fileCalls[0].FileBody))
+	}
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, cond func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(message)
 }
