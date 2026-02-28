@@ -5,8 +5,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./:/app
+    env_file:
+      - .env
     environment:
-      ENVIRONMENT: development
+      ENV: development
 
   postgres:
     image: postgres:17.9

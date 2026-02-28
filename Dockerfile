@@ -1,3 +1,5 @@
+FROM golangci/golangci-lint:v2.10.1 AS golangci-lint
+
 # Building image
 FROM golang:1.26.0-alpine AS builder
 
@@ -8,7 +10,8 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -o main cmd/backend/main.go
+RUN apk add --no-cache opus-dev opusfile-dev pkgconfig gcc musl-dev git
+RUN CGO_ENABLED=1 go build -o main cmd/backend/main.go
 
 
 # Development image
@@ -16,7 +19,9 @@ FROM golang:1.26.0-alpine AS development
 
 WORKDIR /app
 
+RUN apk add --no-cache opus-dev opusfile-dev pkgconfig gcc musl-dev git
 RUN go install github.com/air-verse/air@v1.64.5
+COPY --from=golangci-lint /usr/bin/golangci-lint /usr/local/bin/golangci-lint
 
 COPY go.mod go.sum ./
 RUN go mod download
