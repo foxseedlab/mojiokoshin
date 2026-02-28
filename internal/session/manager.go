@@ -231,6 +231,10 @@ func (m *Manager) handleBotRemovalEvent(event discord.VoiceStateEvent) bool {
 }
 
 func (m *Manager) trackVoiceParticipants(event discord.VoiceStateEvent) {
+	if event.BeforeChannelID == "" && event.AfterChannelID == "" {
+		m.removeParticipantFromKnownSessions(event.GuildID, event.UserID, event.UserIsBot)
+		return
+	}
 	if event.BeforeChannelID != "" {
 		if err := m.removeParticipantAndMaybeStop(event.GuildID, event.BeforeChannelID, event.UserID, event.UserIsBot); err != nil {
 			slog.Error("failed to remove participant", "error", err, "guild_id", event.GuildID, "channel_id", event.BeforeChannelID, "user_id", event.UserID)
@@ -239,6 +243,40 @@ func (m *Manager) trackVoiceParticipants(event discord.VoiceStateEvent) {
 	if event.AfterChannelID != "" {
 		m.addParticipantIfSessionRunning(event.GuildID, event.AfterChannelID, event.UserID, event.UserIsBot)
 	}
+}
+
+func (m *Manager) removeParticipantFromKnownSessions(guildID, userID string, userIsBot bool) {
+	if strings.TrimSpace(guildID) == "" || strings.TrimSpace(userID) == "" {
+		return
+	}
+	channelIDs := m.findSessionChannelsByActiveParticipant(guildID, userID)
+	for _, channelID := range channelIDs {
+		if err := m.removeParticipantAndMaybeStop(guildID, channelID, userID, userIsBot); err != nil {
+			slog.Error("failed to remove participant from inferred channel", "error", err, "guild_id", guildID, "channel_id", channelID, "user_id", userID)
+		}
+	}
+}
+
+func (m *Manager) findSessionChannelsByActiveParticipant(guildID, userID string) []string {
+	prefix := guildID + ":"
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]string, 0, 1)
+	for key, rs := range m.sessions {
+		if !strings.HasPrefix(key, prefix) || rs == nil {
+			continue
+		}
+		if _, ok := rs.activeParticipants[userID]; !ok {
+			continue
+		}
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+			continue
+		}
+		out = append(out, parts[1])
+	}
+	return out
 }
 
 func (m *Manager) startAutoTranscribeIfConfigured(event discord.VoiceStateEvent) {

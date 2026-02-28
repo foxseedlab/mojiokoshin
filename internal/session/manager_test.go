@@ -449,6 +449,44 @@ func TestHandleVoiceStateUpdate_TracksLeaveEvenWhenAutoDisabled(t *testing.T) {
 	}
 }
 
+func TestHandleVoiceStateUpdate_TracksLeaveWhenBeforeChannelIsUnknown(t *testing.T) {
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{botUserID: "bot-self"}
+	manager := newTestManager(repo, dc)
+	manager.SetBotUserID("bot-self")
+	manager.cfg.DiscordAutoTranscribe = false
+
+	key := manager.sessionKey("guild-1", "vc-1")
+	manager.sessions[key] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-unknown-leave",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{
+			"user-1": {isBot: false},
+		},
+		allParticipants: map[string]participantState{
+			"user-1":   {isBot: false},
+			"bot-self": {isBot: true},
+		},
+	}
+
+	manager.HandleVoiceStateUpdate(discord.VoiceStateEvent{
+		GuildID:         "guild-1",
+		UserID:          "user-1",
+		UserIsBot:       false,
+		BeforeChannelID: "",
+		AfterChannelID:  "",
+	})
+
+	if manager.isSessionRunning("guild-1", "vc-1") {
+		t.Fatal("expected session to stop after unknown-channel leave event")
+	}
+}
+
 func TestPoweredByShownOnlyOnStartAndAttachment(t *testing.T) {
 	repo := &mockRepository{}
 	dc := &mockDiscordClient{}

@@ -3,8 +3,10 @@ package discord
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,7 +87,7 @@ func (c *Client) RegisterVoiceStateUpdateHandler(handler func(discordpkg.VoiceSt
 			beforeChannelID = vs.BeforeUpdate.ChannelID
 		}
 		afterChannelID := vs.ChannelID
-		if beforeChannelID == afterChannelID {
+		if beforeChannelID == afterChannelID && beforeChannelID != "" {
 			return
 		}
 		if vs.GuildID == "" || vs.UserID == "" {
@@ -185,23 +187,47 @@ func (c *Client) upsertGuildSlashCommand(appID, guildID string, def discordpkg.S
 }
 
 func (c *Client) GetUserVoiceChannelID(guildID, userID string) (string, error) {
-	if c.session == nil || c.session.State == nil {
+	if c.session == nil {
 		return "", nil
 	}
-	vs, err := c.session.State.VoiceState(guildID, userID)
-	if err == nil && vs != nil {
-		return vs.ChannelID, nil
-	}
-	guild, err := c.session.State.Guild(guildID)
-	if err != nil || guild == nil {
-		return "", nil
-	}
-	for _, state := range guild.VoiceStates {
-		if state != nil && state.UserID == userID {
-			return state.ChannelID, nil
+	if c.session.State != nil {
+		vs, err := c.session.State.VoiceState(guildID, userID)
+		if err == nil && vs != nil {
+			return vs.ChannelID, nil
+		}
+		guild, err := c.session.State.Guild(guildID)
+		if err == nil && guild != nil {
+			for _, state := range guild.VoiceStates {
+				if state != nil && state.UserID == userID {
+					return state.ChannelID, nil
+				}
+			}
 		}
 	}
-	return "", nil
+
+	// Cache may be cold right after bot startup; ask Discord API directly as fallback.
+	vs, err := c.session.UserVoiceState(guildID, userID)
+	if err != nil {
+		if isRESTNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	if vs == nil {
+		return "", nil
+	}
+	return vs.ChannelID, nil
+}
+
+func isRESTNotFound(err error) bool {
+	var restErr *discordgo.RESTError
+	if !errors.As(err, &restErr) {
+		return false
+	}
+	if restErr.Response == nil {
+		return false
+	}
+	return restErr.Response.StatusCode == http.StatusNotFound
 }
 
 func (c *Client) ListVoiceChannelParticipants(guildID, channelID string) ([]discordpkg.VoiceParticipant, error) {
