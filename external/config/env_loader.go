@@ -20,6 +20,7 @@ type envConfig struct {
 	DiscordGuildID             string `env:"DISCORD_GUILD_ID,required"`
 	DiscordAutoTranscribe      bool   `env:"DISCORD_AUTO_TRANSCRIBE" envDefault:"false"`
 	DiscordAutoTranscribableVC string `env:"DISCORD_AUTO_TRANSCRIBABLE_VC_ID"`
+	DiscordShowPoweredBy       bool   `env:"DISCORD_MESSAGE_SHOW_POWERED_BY" envDefault:"true"`
 	DiscordCountOtherBots      bool   `env:"DISCORD_COUNT_OTHER_BOTS_AS_PARTICIPANTS" envDefault:"false"`
 	TranscriptTimezone         string `env:"TRANSCRIPT_TIMEZONE" envDefault:"Asia/Tokyo"`
 	TranscriptWebhookURL       string `env:"TRANSCRIPT_WEBHOOK_URL"`
@@ -47,6 +48,7 @@ func Load() (*internalconfig.Config, error) {
 		DiscordCountOtherBots:      raw.DiscordCountOtherBots,
 		TranscriptTimezone:         raw.TranscriptTimezone,
 		TranscriptWebhookURL:       raw.TranscriptWebhookURL,
+		DiscordShowPoweredBy:       raw.DiscordShowPoweredBy,
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err

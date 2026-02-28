@@ -21,6 +21,7 @@ type Config struct {
 	DiscordCountOtherBots      bool
 	TranscriptTimezone         string
 	TranscriptWebhookURL       string
+	DiscordShowPoweredBy       bool
 }
 
 func (c *Config) Validate() error {
