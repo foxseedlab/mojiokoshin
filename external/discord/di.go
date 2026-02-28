@@ -9,6 +9,6 @@ import (
 func RegisterDI(injector do.Injector) {
 	do.Provide(injector, func(i do.Injector) (discordpkg.Client, error) {
 		c := do.MustInvoke[*config.Config](i)
-		return NewClient(c.DiscordToken, c.DiscordGuildID, c.DiscordVCID), nil
+		return NewClient(c.DiscordToken), nil
 	})
 }

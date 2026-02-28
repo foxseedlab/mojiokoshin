@@ -16,6 +16,29 @@ type CompleteSessionInput struct {
 	EndedAt   time.Time
 }
 
+type SessionParticipantSnapshot struct {
+	UserID      string
+	DisplayName string
+	IsBot       bool
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+}
+
+type SaveSessionOutputInput struct {
+	SessionID          string
+	EndedAt            time.Time
+	StopReason         string
+	GuildName          string
+	ChannelName        string
+	Timezone           string
+	DurationSeconds    int64
+	SegmentCount       int
+	Participants       []SessionParticipantSnapshot
+	TranscriptFilename string
+	TranscriptText     string
+	WebhookPayloadJSON []byte
+}
+
 type InsertSegmentInput struct {
 	SessionID    string
 	Content      string
@@ -26,6 +49,7 @@ type InsertSegmentInput struct {
 type SessionRepository interface {
 	CreateSession(ctx context.Context, input CreateSessionInput) (*Session, error)
 	UpdateSessionCompleted(ctx context.Context, input CompleteSessionInput) error
+	SaveSessionOutput(ctx context.Context, input SaveSessionOutputInput) error
 	GetRunningSessionByChannel(ctx context.Context, guildID, channelID string) (*Session, error)
 }
 

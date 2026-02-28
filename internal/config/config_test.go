@@ -12,7 +12,8 @@ func TestValidate_Valid(t *testing.T) {
 		GoogleCloudCredentialsJSON: `{"type":"service_account"}`,
 		DiscordToken:               "token",
 		DiscordGuildID:             "guild",
-		DiscordVCID:                "vc",
+		DiscordAutoTranscribe:      false,
+		TranscriptTimezone:         "Asia/Tokyo",
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -28,10 +29,27 @@ func TestValidate_InvalidMaxDuration(t *testing.T) {
 		GoogleCloudCredentialsJSON: `{"type":"service_account"}`,
 		DiscordToken:               "token",
 		DiscordGuildID:             "guild",
-		DiscordVCID:                "vc",
+		TranscriptTimezone:         "Asia/Tokyo",
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for non-positive max duration")
+	}
+}
+
+func TestValidate_AutoEnabledRequiresVCID(t *testing.T) {
+	cfg := &Config{
+		DefaultTranscribeLanguage:  "ja-JP",
+		MaxTranscribeDurationMin:   30,
+		DatabaseURL:                "postgres://user:pass@localhost:5432/mojiokoshin",
+		GoogleCloudProjectID:       "project-id",
+		GoogleCloudCredentialsJSON: `{"type":"service_account"}`,
+		DiscordToken:               "token",
+		DiscordGuildID:             "guild",
+		DiscordAutoTranscribe:      true,
+		TranscriptTimezone:         "Asia/Tokyo",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error when auto transcribe is enabled without VC ID")
 	}
 }
 
