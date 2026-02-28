@@ -8,8 +8,7 @@
 
 <p align="center">
   Discordのボイスチャットに最適化された文字起こしシステム。
-</p>
-<p align="center">
+  <br>
   操作を最小限にし、日常利用で迷わないUXを重視。
 </p>
 

@@ -12,7 +12,18 @@ RUN go mod download
 COPY . .
 
 RUN apk add --no-cache opus-dev opusfile-dev pkgconfig gcc musl-dev git
-RUN CGO_ENABLED=1 go build -tags opus -o main cmd/backend/main.go
+RUN CGO_ENABLED=1 go build -tags opus -o /app/main cmd/backend/main.go
+
+# Runtime image
+# CGOと共有opusライブラリに依存しているため、distroless ではなくAlpineランタイムを採用する
+FROM alpine:3.23.3 AS production
+
+WORKDIR /app
+
+RUN apk add --no-cache opus opusfile
+COPY --from=builder /app/main /app/main
+
+ENTRYPOINT ["/app/main"]
 
 
 # Development image
