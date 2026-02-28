@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"time"
+	_ "time/tzdata"
 )
 
 type Config struct {
