@@ -1,3 +1,4 @@
+# Lint image
 FROM golangci/golangci-lint:v2.10.1 AS golangci-lint
 
 # Building image
