@@ -1,20 +1,32 @@
-@PHONY: up
+.PHONY: up
 up:
 	docker compose up -d
 
-@PHONY: up-no-daemon
+.PHONY: up-no-daemon
 up-no-daemon:
 	docker compose up
 
-@PHONY: down
+.PHONY: down
 down:
 	docker compose down
 
-@PHONY: destroy
+.PHONY: destroy
 destroy:
 	docker compose stop
 	docker compose rm -f
 
-@PHONY: lint
+.PHONY: build
+build:
+	docker build --target builder -t mojiokoshin-builder .
+
+.PHONY: lint
 lint:
-	docker run --rm -v ./:/app -w /app golangci/golangci-lint:v2.10.1 golangci-lint run
+	docker compose run --rm backend golangci-lint run
+
+.PHONY: format
+format:
+	docker compose run --rm backend golangci-lint fmt -E gofmt
+
+.PHONY: test
+test:
+	docker compose run --rm backend go test ./...
