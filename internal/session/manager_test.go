@@ -17,10 +17,11 @@ import (
 )
 
 type mockRepository struct {
-	insertCalls      []repository.InsertSegmentInput
-	savedOutputCalls []repository.SaveSessionOutputInput
-	createCount      int
-	listSegmentsErr  error
+	insertCalls       []repository.InsertSegmentInput
+	savedOutputCalls  []repository.SaveSessionOutputInput
+	createCount       int
+	listSegmentsErr   error
+	listSegmentsDelay time.Duration
 }
 
 func (m *mockRepository) CreateSession(_ context.Context, input repository.CreateSessionInput) (*repository.Session, error) {
@@ -52,7 +53,16 @@ func (m *mockRepository) InsertSegment(_ context.Context, input repository.Inser
 	return nil
 }
 
-func (m *mockRepository) ListSegmentsBySessionID(_ context.Context, _ string) ([]repository.TranscriptSegment, error) {
+func (m *mockRepository) ListSegmentsBySessionID(ctx context.Context, _ string) ([]repository.TranscriptSegment, error) {
+	if m.listSegmentsDelay > 0 {
+		timer := time.NewTimer(m.listSegmentsDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if m.listSegmentsErr != nil {
 		return nil, m.listSegmentsErr
 	}
@@ -64,6 +74,8 @@ type mockDiscordClient struct {
 	fileCalls            []discord.FileMessage
 	userVoiceChannelByID map[string]string
 	botUserID            string
+	resolveMetadataErr   error
+	resolveMetadataDelay time.Duration
 }
 
 func (m *mockDiscordClient) Connect(_ context.Context) error { return nil }
@@ -100,7 +112,19 @@ func (m *mockDiscordClient) GetBotUserID() (string, error) {
 	}
 	return "bot-self", nil
 }
-func (m *mockDiscordClient) ResolveTranscriptMetadata(_ context.Context, guildID, channelID string, participantUserIDs []string) (discord.TranscriptMetadata, error) {
+func (m *mockDiscordClient) ResolveTranscriptMetadata(ctx context.Context, guildID, channelID string, participantUserIDs []string) (discord.TranscriptMetadata, error) {
+	if m.resolveMetadataDelay > 0 {
+		timer := time.NewTimer(m.resolveMetadataDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return discord.TranscriptMetadata{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if m.resolveMetadataErr != nil {
+		return discord.TranscriptMetadata{}, m.resolveMetadataErr
+	}
 	participants := make([]discord.TranscriptParticipant, 0, len(participantUserIDs))
 	for _, userID := range participantUserIDs {
 		participants = append(participants, discord.TranscriptParticipant{UserID: userID, DisplayName: userID})
@@ -648,6 +672,105 @@ func TestFinalizeSession_ContinuesWhenSegmentLookupFails(t *testing.T) {
 		t.Fatal("expected session to be stopped")
 	}
 	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment even when segment lookup fails")
+}
+
+func TestFinalizeSession_SendsStopMessageBeforeSegmentLookup(t *testing.T) {
+	oldTimeout := finalizeSegmentLookupTimeout
+	finalizeSegmentLookupTimeout = 150 * time.Millisecond
+	defer func() { finalizeSegmentLookupTimeout = oldTimeout }()
+
+	repo := &mockRepository{listSegmentsDelay: 3 * time.Second}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-stop-first",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonServerClosed)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, 300*time.Millisecond, func() bool { return len(dc.sendCalls) >= 1 }, "expected stop message to be sent immediately")
+	if dc.sendCalls[0] != manager.stopChannelMessage(stopReasonServerClosed) {
+		t.Fatalf("unexpected stop message: %q", dc.sendCalls[0])
+	}
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment after segment lookup timeout")
+}
+
+func TestFinalizeSession_ContinuesWhenMetadataLookupTimesOut(t *testing.T) {
+	oldTimeout := finalizeMetadataTimeout
+	finalizeMetadataTimeout = 100 * time.Millisecond
+	defer func() { finalizeMetadataTimeout = oldTimeout }()
+
+	repo := &mockRepository{}
+	dc := &mockDiscordClient{resolveMetadataDelay: 2 * time.Second}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-meta-timeout",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonUnknownError)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected attachment even when metadata lookup times out")
+	if len(repo.savedOutputCalls) != 1 {
+		t.Fatalf("expected one persisted session output, got %d", len(repo.savedOutputCalls))
+	}
+}
+
+func TestFinalizeSession_AttachmentContainsFallbackNoticeWhenSegmentsUnavailable(t *testing.T) {
+	repo := &mockRepository{listSegmentsErr: errors.New("boom")}
+	dc := &mockDiscordClient{}
+	manager := newTestManager(repo, dc)
+	manager.sessions[manager.sessionKey("guild-1", "vc-1")] = &runningSession{
+		repoSession: &repository.Session{
+			ID:        "session-fallback-attachment",
+			GuildID:   "guild-1",
+			ChannelID: "vc-1",
+			StartedAt: time.Now(),
+			Status:    repository.SessionStatusRunning,
+		},
+		activeParticipants: map[string]participantState{"user-1": {isBot: false}},
+		allParticipants:    map[string]participantState{"user-1": {isBot: false}},
+	}
+
+	stopped, err := manager.stopSession("guild-1", "vc-1", stopReasonUnknownError)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stopped {
+		t.Fatal("expected session to be stopped")
+	}
+
+	waitUntil(t, time.Second, func() bool { return len(dc.fileCalls) == 1 }, "expected transcript attachment")
+	if !strings.Contains(string(dc.fileCalls[0].FileBody), "文字起こし本文の取得に失敗") {
+		t.Fatalf("expected fallback notice in attachment body, got: %q", string(dc.fileCalls[0].FileBody))
+	}
 }
 
 func waitUntil(t *testing.T, timeout time.Duration, cond func() bool, message string) {

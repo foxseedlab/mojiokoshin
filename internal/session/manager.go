@@ -23,7 +23,7 @@ import (
 const (
 	audioMixInterval = 20 * time.Millisecond
 	audioFrameBytes  = 960 * 2 * 2
-	stopAllWaitLimit = 15 * time.Second
+	stopAllWaitLimit = 25 * time.Second
 
 	commandMojiokoshi     = "mojiokoshi"
 	commandMojiokoshiStop = "mojiokoshi-stop"
@@ -39,6 +39,11 @@ const (
 const (
 	StopReasonServerClosed = stopReasonServerClosed
 	StopReasonUnknownError = stopReasonUnknownError
+)
+
+var (
+	finalizeSegmentLookupTimeout = 3 * time.Second
+	finalizeMetadataTimeout      = 2 * time.Second
 )
 
 type Manager struct {
@@ -761,14 +766,18 @@ func (m *Manager) terminateSessionRuntime(rs *runningSession) {
 }
 
 func (m *Manager) runFinalizeSession(rs *runningSession, channelID, reason string, endedAt time.Time) {
+	started := time.Now()
+	sessionID := ""
+	if rs != nil && rs.repoSession != nil {
+		sessionID = rs.repoSession.ID
+	}
+	slog.Info("session finalization started", "session_id", sessionID, "channel_id", channelID, "reason", reason)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			sessionID := ""
-			if rs != nil && rs.repoSession != nil {
-				sessionID = rs.repoSession.ID
-			}
 			slog.Error("panic while finalizing session", "panic", recovered, "session_id", sessionID, "channel_id", channelID, "reason", reason)
+			return
 		}
+		slog.Info("session finalization completed", "session_id", sessionID, "channel_id", channelID, "reason", reason, "elapsed_ms", time.Since(started).Milliseconds())
 	}()
 	m.finalizeSession(rs, channelID, reason, endedAt)
 }
@@ -780,12 +789,23 @@ func (m *Manager) finalizeSession(rs *runningSession, channelID, reason string, 
 		return
 	}
 	s := rs.repoSession
-	segments := m.listSegmentsBestEffort(ctx, s.ID)
+	m.sendDiscordStopMessage(s.ID, channelID, reason)
+
+	segmentsCtx, cancelSegments := context.WithTimeout(ctx, finalizeSegmentLookupTimeout)
+	segments, segmentsAvailable := m.listSegmentsBestEffort(segmentsCtx, s.ID)
+	cancelSegments()
+
 	participantUserIDs := participantUserIDsFromStates(rs.allParticipants)
-	meta := m.resolveTranscriptMetadataBestEffort(ctx, s, participantUserIDs, rs.allParticipants)
+	metadataCtx, cancelMetadata := context.WithTimeout(ctx, finalizeMetadataTimeout)
+	meta := m.resolveTranscriptMetadataBestEffort(metadataCtx, s, participantUserIDs, rs.allParticipants)
+	cancelMetadata()
+
 	filename := fmt.Sprintf("transcript-%s.txt", s.ID)
 	body := buildTranscriptText(meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
-	m.sendDiscordFinalMessages(s.ID, channelID, reason, filename, body)
+	if !segmentsAvailable {
+		body = append(body, []byte("\n\n(文字起こし本文の取得に失敗したため、取得できた範囲のみを添付しています)\n")...)
+	}
+	m.sendDiscordTranscriptAttachment(s.ID, channelID, filename, body)
 	m.completeSessionBestEffort(ctx, s.ID, endedAt)
 
 	payload := buildTranscriptWebhookPayload(s.ID, meta, s.StartedAt, endedAt, m.cfg.TranscriptTimezone, m.transcriptLocation, segments)
@@ -794,13 +814,13 @@ func (m *Manager) finalizeSession(rs *runningSession, channelID, reason string, 
 	m.sendWebhookBestEffort(ctx, s.ID, payload)
 }
 
-func (m *Manager) listSegmentsBestEffort(ctx context.Context, sessionID string) []repository.TranscriptSegment {
+func (m *Manager) listSegmentsBestEffort(ctx context.Context, sessionID string) ([]repository.TranscriptSegment, bool) {
 	segments, err := m.repo.ListSegmentsBySessionID(ctx, sessionID)
 	if err != nil {
 		slog.Error("failed to list transcript segments", "error", err, "session_id", sessionID)
-		return []repository.TranscriptSegment{}
+		return []repository.TranscriptSegment{}, false
 	}
-	return segments
+	return segments, true
 }
 
 func participantUserIDsFromStates(states map[string]participantState) []string {
@@ -823,10 +843,13 @@ func (m *Manager) resolveTranscriptMetadataBestEffort(ctx context.Context, s *re
 	return meta
 }
 
-func (m *Manager) sendDiscordFinalMessages(sessionID, channelID, reason, filename string, body []byte) {
+func (m *Manager) sendDiscordStopMessage(sessionID, channelID, reason string) {
 	if err := m.discord.SendChannelMessage(channelID, m.stopChannelMessage(reason)); err != nil {
 		slog.Error("failed to send stop message", "error", err, "session_id", sessionID, "channel_id", channelID, "reason", reason)
 	}
+}
+
+func (m *Manager) sendDiscordTranscriptAttachment(sessionID, channelID, filename string, body []byte) {
 	if err := m.discord.SendChannelMessageWithFile(discord.FileMessage{
 		ChannelID: channelID,
 		Content:   m.transcriptAttachmentMessage(),
