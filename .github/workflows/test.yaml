@@ -21,8 +21,13 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.0"
+          go-version-file: go.mod
           cache: true
 
+      - name: Install native deps for opus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libopus-dev libopusfile-dev
+
       - name: Test Go Code
-        run: go test ./...
+        run: CGO_ENABLED=1 go test -tags opus ./...

@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 RUN apk add --no-cache opus-dev opusfile-dev pkgconfig gcc musl-dev git
-RUN CGO_ENABLED=1 go build -o main cmd/backend/main.go
+RUN CGO_ENABLED=1 go build -tags opus -o main cmd/backend/main.go
 
 
 # Development image

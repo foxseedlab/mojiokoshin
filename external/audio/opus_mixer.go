@@ -1,3 +1,5 @@
+//go:build opus
+
 package audio
 
 import (
