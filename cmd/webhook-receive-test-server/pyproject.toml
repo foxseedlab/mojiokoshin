@@ -1,0 +1,9 @@
+[project]
+name = "webhook-receive-test-server"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13.12"
+dependencies = [
+    "fastapi>=0.134.0",
+    "uvicorn>=0.41.0",
+]
