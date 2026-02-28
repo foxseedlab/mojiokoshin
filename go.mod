@@ -3,6 +3,7 @@ module github.com/foxseedlab/mojiokoshin
 go 1.26.0
 
 require (
+	cloud.google.com/go/auth v0.18.2
 	cloud.google.com/go/speech v1.30.0
 	github.com/bwmarrin/discordgo v0.29.1-0.20260214123928-f43dd94faaac
 	github.com/caarlos0/env/v11 v11.4.0
@@ -10,11 +11,11 @@ require (
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/samber/do/v2 v2.0.0
 	google.golang.org/api v0.269.0
+	google.golang.org/grpc v1.79.1
 )
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
-	cloud.google.com/go/auth v0.18.2 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	cloud.google.com/go/longrunning v0.8.0 // indirect
@@ -46,6 +47,5 @@ require (
 	google.golang.org/genproto v0.0.0-20260128011058-8636f8732409 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260203192932-546029d2fa20 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260217215200-42d3e9bedb6d // indirect
-	google.golang.org/grpc v1.79.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
