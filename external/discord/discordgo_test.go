@@ -32,12 +32,14 @@ func TestGetUserVoiceChannelID_UsesStateCacheFirst(t *testing.T) {
 		t.Fatalf("unexpected REST call: %s %s", req.Method, req.URL.String())
 		return nil, nil
 	})
-	s.State.GuildAdd(&discordgo.Guild{
+	if err := s.State.GuildAdd(&discordgo.Guild{
 		ID: "guild-1",
 		VoiceStates: []*discordgo.VoiceState{
 			{GuildID: "guild-1", ChannelID: "vc-1", UserID: "user-1"},
 		},
-	})
+	}); err != nil {
+		t.Fatalf("failed to add guild to state: %v", err)
+	}
 
 	c := &Client{session: s}
 	channelID, err := c.GetUserVoiceChannelID("guild-1", "user-1")

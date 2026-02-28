@@ -11,6 +11,7 @@ import (
 	"github.com/foxseedlab/mojiokoshin/internal/webhook"
 )
 
+// 変更容易性を高めるため、time.DateTime をあえて指定していない
 const transcriptTimeLayout = "2006-01-02 15:04:05"
 
 func buildTranscriptText(meta discord.TranscriptMetadata, startedAt, endedAt time.Time, timezone string, loc *time.Location, segments []repository.TranscriptSegment) []byte {

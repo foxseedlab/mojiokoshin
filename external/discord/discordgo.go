@@ -190,21 +190,33 @@ func (c *Client) GetUserVoiceChannelID(guildID, userID string) (string, error) {
 	if c.session == nil {
 		return "", nil
 	}
-	if c.session.State != nil {
-		vs, err := c.session.State.VoiceState(guildID, userID)
-		if err == nil && vs != nil {
-			return vs.ChannelID, nil
-		}
-		guild, err := c.session.State.Guild(guildID)
-		if err == nil && guild != nil {
-			for _, state := range guild.VoiceStates {
-				if state != nil && state.UserID == userID {
-					return state.ChannelID, nil
-				}
-			}
+	if channelID, ok := c.voiceChannelIDFromState(guildID, userID); ok {
+		return channelID, nil
+	}
+	return c.voiceChannelIDFromREST(guildID, userID)
+}
+
+func (c *Client) voiceChannelIDFromState(guildID, userID string) (string, bool) {
+	if c.session.State == nil {
+		return "", false
+	}
+	vs, err := c.session.State.VoiceState(guildID, userID)
+	if err == nil && vs != nil {
+		return vs.ChannelID, true
+	}
+	guild, err := c.session.State.Guild(guildID)
+	if err != nil || guild == nil {
+		return "", false
+	}
+	for _, state := range guild.VoiceStates {
+		if state != nil && state.UserID == userID {
+			return state.ChannelID, true
 		}
 	}
+	return "", false
+}
 
+func (c *Client) voiceChannelIDFromREST(guildID, userID string) (string, error) {
 	// Cache may be cold right after bot startup; ask Discord API directly as fallback.
 	vs, err := c.session.UserVoiceState(guildID, userID)
 	if err != nil {
