@@ -3,8 +3,8 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"mime/multipart"
 	"net/http"
 
 	"github.com/foxseedlab/mojiokoshin/internal/webhook"
@@ -22,29 +22,20 @@ func NewHTTPSender(webhookURL string) webhook.Sender {
 	}
 }
 
-func (s *HTTPSender) SendTranscript(ctx context.Context, filename string, body []byte) error {
+func (s *HTTPSender) SendTranscript(ctx context.Context, payload webhook.TranscriptWebhookPayload) error {
 	if s.webhookURL == "" {
 		return nil
 	}
 
-	var payload bytes.Buffer
-	writer := multipart.NewWriter(&payload)
-	fileWriter, err := writer.CreateFormFile("file", filename)
+	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	if _, err := fileWriter.Write(body); err != nil {
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.webhookURL, &payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.webhookURL, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err

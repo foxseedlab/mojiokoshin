@@ -32,7 +32,7 @@ func main() {
 	injector := setupDI(cfg)
 
 	slog.Info("startup: launching discord bot")
-	runBot(injector)
+	runBot(cfg, injector)
 }
 
 func mustLoadConfig() *config.Config {
@@ -66,7 +66,7 @@ func setupDI(cfg *config.Config) do.Injector {
 	return injector
 }
 
-func runBot(injector do.Injector) {
+func runBot(cfg *config.Config, injector do.Injector) {
 	dc, err := do.Invoke[discordpkg.Client](injector)
 	if err != nil {
 		slog.Error("failed to resolve discord client", "error", err)
@@ -88,7 +88,21 @@ func runBot(injector do.Injector) {
 	}
 	slog.Info("startup: discord connected")
 
+	botUserID, err := dc.GetBotUserID()
+	if err != nil {
+		slog.Error("failed to resolve bot user id", "error", err)
+		os.Exit(1)
+	}
+	manager.SetBotUserID(botUserID)
+
+	if err := dc.UpsertGuildSlashCommands(cfg.DiscordGuildID, session.SlashCommandDefinitions()); err != nil {
+		slog.Error("failed to upsert slash commands", "error", err, "guild_id", cfg.DiscordGuildID)
+		os.Exit(1)
+	}
+
 	dc.RegisterVoiceStateUpdateHandler(manager.HandleVoiceStateUpdate)
+	dc.RegisterSlashCommandHandler(manager.HandleSlashCommand)
+	slog.Info("discord handlers registered", "guild_id", cfg.DiscordGuildID, "commands", []string{"mojiokoshi", "mojiokoshi-stop"})
 	defer func() {
 		if err := dc.Close(); err != nil {
 			slog.Error("discord close failed", "error", err)
