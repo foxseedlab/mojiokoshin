@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build And Release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install native deps for opus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libopus-dev libopusfile-dev
+
+      - name: Build release artifact
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -tags opus -o dist/mojiokoshin-linux-amd64 ./cmd/backend
+          tar -C dist -czf dist/mojiokoshin-linux-amd64.tar.gz mojiokoshin-linux-amd64
+
+      - name: Install ghr
+        run: go install github.com/tcnksm/ghr@v0.18.0
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          "$(go env GOPATH)/bin/ghr" \
+            -t "$GITHUB_TOKEN" \
+            -u "$REPO_OWNER" \
+            -r "$REPO_NAME" \
+            -replace \
+            "$TAG" \
+            dist/
