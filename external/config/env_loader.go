@@ -9,7 +9,7 @@ import (
 
 type envConfig struct {
 	Env                        string `env:"ENV" envDefault:"production"`
-	DefaultTranscribeLanguage  string `env:"DEFAULT_TRANSCRIBE_LANGUAGE,required"`
+	DefaultTranscribeLanguage  string `env:"DEFAULT_TRANSCRIBE_LANGUAGE" envDefault:"ja-JP"`
 	MaxTranscribeDurationMin   int    `env:"MAX_TRANSCRIBE_DURATION_MIN" envDefault:"120"`
 	DatabaseURL                string `env:"DATABASE_URL,required"`
 	GoogleCloudProjectID       string `env:"GOOGLE_CLOUD_PROJECT_ID,required"`
